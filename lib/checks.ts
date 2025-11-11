@@ -127,9 +127,10 @@ async function checkOpenAI(config: ProviderConfig): Promise<CheckResult> {
     ],
     max_tokens: 3,
     temperature: 0,
+    stream: true, // 启用流式响应
   };
 
-  return runHttpCheck(config, {
+  return runStreamCheck(config, {
     url,
     displayEndpoint: config.endpoint,
     init: {
@@ -139,13 +140,16 @@ async function checkOpenAI(config: ProviderConfig): Promise<CheckResult> {
       },
       body: JSON.stringify(payload),
     },
+    parseStream: parseOpenAIStream,
   });
 }
 
 async function checkGemini(config: ProviderConfig): Promise<CheckResult> {
-  const normalized = config.endpoint.endsWith(":generateContent")
+  const normalized = config.endpoint.endsWith(":streamGenerateContent")
     ? config.endpoint
-    : `${config.endpoint.replace(/\/$/, "")}/models/${config.model}:generateContent`;
+    : config.endpoint.endsWith(":generateContent")
+    ? config.endpoint.replace(":generateContent", ":streamGenerateContent")
+    : `${config.endpoint.replace(/\/$/, "")}/models/${config.model}:streamGenerateContent`;
 
   const url = appendQuery(normalized, `key=${config.apiKey}`);
   const payload = {
@@ -157,13 +161,14 @@ async function checkGemini(config: ProviderConfig): Promise<CheckResult> {
     ],
   };
 
-  return runHttpCheck(config, {
+  return runStreamCheck(config, {
     url,
     displayEndpoint: config.endpoint,
     init: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
+    parseStream: parseGeminiStream,
   });
 }
 
@@ -173,9 +178,10 @@ async function checkAnthropic(config: ProviderConfig): Promise<CheckResult> {
     model: config.model,
     max_tokens: 10,
     messages: [{ role: "user", content: "ping" }],
+    stream: true, // 启用流式响应
   };
 
-  return runHttpCheck(config, {
+  return runStreamCheck(config, {
     url,
     displayEndpoint: config.endpoint,
     init: {
@@ -186,7 +192,215 @@ async function checkAnthropic(config: ProviderConfig): Promise<CheckResult> {
       },
       body: JSON.stringify(payload),
     },
+    parseStream: parseAnthropicStream,
   });
+}
+
+// 流式响应解析器类型
+type StreamParser = (reader: ReadableStreamDefaultReader<Uint8Array>) => Promise<string>;
+
+// 运行流式检查
+async function runStreamCheck(
+  config: ProviderConfig,
+  params: {
+    url: string;
+    displayEndpoint?: string;
+    init: RequestInit;
+    parseStream: StreamParser;
+  }
+): Promise<CheckResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(params.url, {
+      method: "POST",
+      signal: controller.signal,
+      ...params.init,
+    });
+
+    if (!response.ok) {
+      const latencyMs = Date.now() - startedAt;
+      const errorBody = await response.text();
+      const message = extractMessage(errorBody) || `HTTP ${response.status}`;
+
+      return {
+        id: config.id,
+        name: config.name,
+        type: config.type,
+        endpoint: params.displayEndpoint || params.url,
+        model: config.model,
+        status: "failed",
+        latencyMs,
+        checkedAt: new Date().toISOString(),
+        message,
+      };
+    }
+
+    if (!response.body) {
+      throw new Error("响应体为空");
+    }
+
+    const reader = response.body.getReader();
+
+    // 解析流式响应
+    await params.parseStream(reader);
+
+    const latencyMs = Date.now() - startedAt;
+    const status: HealthStatus =
+      latencyMs <= DEGRADED_THRESHOLD_MS ? "operational" : "degraded";
+
+    const message =
+      status === "degraded"
+        ? `响应成功但耗时 ${latencyMs}ms`
+        : `流式响应正常 (${latencyMs}ms)`;
+
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: params.displayEndpoint || params.url,
+      model: config.model,
+      status,
+      latencyMs,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } catch (error) {
+    const err = error as Error & { name?: string };
+    const message = err?.name === "AbortError" ? "请求超时" : err?.message || "未知错误";
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: params.displayEndpoint || params.url,
+      model: config.model,
+      status: "failed",
+      latencyMs: null,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// OpenAI 流式响应解析器
+async function parseOpenAIStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let fullResponse = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    const lines = chunk.split("\n").filter((line) => line.trim());
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const data = line.slice(6);
+        if (data === "[DONE]") {
+          return fullResponse;
+        }
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content || "";
+          fullResponse += content;
+        } catch {
+          // 忽略解析错误
+        }
+      }
+    }
+  }
+
+  return fullResponse;
+}
+
+// Anthropic 流式响应解析器
+async function parseAnthropicStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let fullResponse = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || ""; // 保留最后一个不完整的行
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const data = line.slice(6);
+        try {
+          const parsed = JSON.parse(data);
+
+          // 处理不同类型的事件
+          if (parsed.type === "content_block_delta") {
+            const content = parsed.delta?.text || "";
+            fullResponse += content;
+          }
+        } catch {
+          // 忽略解析错误
+        }
+      }
+    }
+  }
+
+  return fullResponse;
+}
+
+// Gemini 流式响应解析器
+async function parseGeminiStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let fullResponse = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Gemini 返回的是多个 JSON 对象,可能用逗号分隔或换行分隔
+    // 尝试解析所有完整的 JSON 对象
+    const jsonObjects = buffer.split(/\n/).filter(s => s.trim());
+
+    for (let i = 0; i < jsonObjects.length - 1; i++) {
+      try {
+        const parsed = JSON.parse(jsonObjects[i]);
+        const content = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        fullResponse += content;
+      } catch {
+        // 忽略解析错误
+      }
+    }
+
+    // 保留最后一个可能不完整的 JSON
+    buffer = jsonObjects[jsonObjects.length - 1] || "";
+  }
+
+  // 处理最后剩余的 buffer
+  if (buffer.trim()) {
+    try {
+      const parsed = JSON.parse(buffer);
+      const content = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      fullResponse += content;
+    } catch {
+      // 忽略解析错误
+    }
+  }
+
+  return fullResponse;
 }
 
 async function runHttpCheck(
