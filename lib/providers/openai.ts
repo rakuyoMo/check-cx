@@ -1,74 +1,135 @@
 /**
- * OpenAI Provider 健康检查
+ * OpenAI Provider 健康检查（使用官方 openai SDK）
  */
 
-import type { CheckResult, ProviderConfig } from "../types";
-import { ensurePath } from "../utils";
-import { runStreamCheck } from "./stream-check";
+import OpenAI from "openai";
+
+import type { CheckResult, HealthStatus, ProviderConfig } from "../types";
+import { DEFAULT_ENDPOINTS } from "../types";
 
 /**
- * OpenAI 流式响应解析器
+ * 默认超时时间 (毫秒)
+ * 与其他 Provider 保持一致
  */
-async function parseOpenAIStream(
-  reader: ReadableStreamDefaultReader<Uint8Array>
-): Promise<string> {
-  const decoder = new TextDecoder();
-  let fullResponse = "";
+const DEFAULT_TIMEOUT_MS = 15_000;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+/**
+ * 性能降级阈值 (毫秒)
+ * 与其他 Provider 保持一致
+ */
+const DEGRADED_THRESHOLD_MS = 6_000;
 
-    const chunk = decoder.decode(value, { stream: true });
-    const lines = chunk.split("\n").filter((line) => line.trim());
+/**
+ * 从配置的 endpoint 推导 openai SDK 的 baseURL
+ *
+ * - 支持默认的 https://api.openai.com/v1/chat/completions
+ * - 支持自定义 /v1/chat/completions 或 Azure 兼容的 /chat/completions 路径
+ */
+function deriveOpenAIBaseURL(endpoint: string | null | undefined): string {
+  const raw = endpoint || DEFAULT_ENDPOINTS.openai;
 
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        const data = line.slice(6);
-        if (data === "[DONE]") {
-          return fullResponse;
-        }
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content || "";
-          fullResponse += content;
-        } catch {
-          // 忽略解析错误
-        }
-      }
-    }
+  // 去掉查询参数
+  const [withoutQuery] = raw.split("?");
+  let base = withoutQuery;
+
+  // 去掉 /chat/completions 这类具体路径，保留前缀
+  const chatIndex = base.indexOf("/chat/completions");
+  if (chatIndex !== -1) {
+    base = base.slice(0, chatIndex);
   }
 
-  return fullResponse;
+  // 对于标准 OpenAI，确保以 /v1 结尾
+  const v1Index = base.indexOf("/v1");
+  if (v1Index !== -1) {
+    base = base.slice(0, v1Index + "/v1".length);
+  } else if (base.includes("api.openai.com")) {
+    // 若未显式包含 /v1，但域名是 api.openai.com，则补上 /v1
+    base = `${base.replace(/\/$/, "")}/v1`;
+  }
+
+  return base;
 }
 
 /**
- * 检查 OpenAI API 健康状态
+ * 检查 OpenAI API 健康状态（流式）
  */
 export async function checkOpenAI(
   config: ProviderConfig
 ): Promise<CheckResult> {
-  const url = ensurePath(config.endpoint, "/v1/chat/completions");
-  const payload = {
-    model: config.model,
-    messages: [
-      { role: "user", content: "hi" }, // 最简短的消息
-    ],
-    max_tokens: 1, // 仅需1个token即可确认服务可用
-    temperature: 0,
-    stream: true, // 启用流式响应
-  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const startedAt = Date.now();
 
-  return runStreamCheck(config, {
-    url,
-    displayEndpoint: config.endpoint,
-    init: {
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        "Content-Type": "application/json",
+  const displayEndpoint = config.endpoint || DEFAULT_ENDPOINTS.openai;
+
+  try {
+    const client = new OpenAI({
+      apiKey: config.apiKey,
+      baseURL: deriveOpenAIBaseURL(config.endpoint),
+      // 某些代理/网关（例如启用了 Cloudflare「封锁 AI 爬虫」规则的站点）
+      // 会对默认的 OpenAI User-Agent（如 `OpenAI/TS ...`）返回 402 Your request was blocked.
+      // 这里统一改成一个普通应用的 UA，避免被误判为爬虫。
+      defaultHeaders: {
+        "User-Agent": "check-cx/0.1.0",
       },
-      body: JSON.stringify(payload),
-    },
-    parseStream: parseOpenAIStream,
-  });
+    });
+
+    // 使用 Chat Completions 流式接口进行最小请求
+    const stream = await client.chat.completions.create(
+      {
+        model: config.model,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 1,
+        temperature: 0,
+        stream: true,
+      },
+      { signal: controller.signal }
+    );
+
+    // 读取完整的流式响应（内容本身不重要，只要能成功流式返回即可）
+    for await (const chunk of stream) {
+      // 这里不需要组装完整内容，仅保证流可读
+      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+      chunk.choices?.[0]?.delta?.content;
+    }
+
+    const latencyMs = Date.now() - startedAt;
+    const status: HealthStatus =
+      latencyMs <= DEGRADED_THRESHOLD_MS ? "operational" : "degraded";
+
+    const message =
+      status === "degraded"
+        ? `响应成功但耗时 ${latencyMs}ms`
+        : `流式响应正常 (${latencyMs}ms)`;
+
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: displayEndpoint,
+      model: config.model,
+      status,
+      latencyMs,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } catch (error) {
+    const err = error as Error & { name?: string };
+    const message =
+      err?.name === "AbortError" ? "请求超时" : err?.message || "未知错误";
+
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: displayEndpoint,
+      model: config.model,
+      status: "failed",
+      latencyMs: null,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
