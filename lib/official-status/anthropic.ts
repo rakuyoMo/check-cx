@@ -1,24 +1,41 @@
 /**
  * Anthropic 官方状态检查器
- * 状态 API: https://status.claude.com/api/v2/status.json
+ * 状态 API: https://status.claude.com/api/v2/summary.json
  */
 
 import type { OfficialStatusResult, OfficialHealthStatus } from "../types";
 import { logError } from "../utils/error-handler";
 
-const ANTHROPIC_STATUS_URL = "https://status.claude.com/api/v2/status.json";
+const ANTHROPIC_STATUS_URL = "https://status.claude.com/api/v2/summary.json";
 const TIMEOUT_MS = 15000; // 15 秒超时
 
 /**
  * Anthropic 状态 API 响应接口
  */
-interface AnthropicStatusResponse {
+interface AnthropicSummaryResponse {
   page: {
     id: string;
     name: string;
     url: string;
+    time_zone: string;
     updated_at: string;
   };
+  components: Array<{
+    id: string;
+    name: string;
+    status: string; // 'operational' | 'degraded_performance' | 'partial_outage' | 'major_outage'
+    created_at: string;
+    updated_at: string;
+    position: number;
+    description: string | null;
+    showcase: boolean;
+    group_id: string | null;
+    page_id: string;
+    group: boolean;
+    only_show_if_degraded: boolean;
+  }>;
+  incidents: Array<unknown>;
+  scheduled_maintenances: Array<unknown>;
   status: {
     indicator: string; // 'none' | 'minor' | 'major' | 'critical'
     description: string; // 'All Systems Operational' | ...
@@ -52,8 +69,8 @@ export async function checkAnthropicStatus(): Promise<OfficialStatusResult> {
       };
     }
 
-    const data = (await response.json()) as AnthropicStatusResponse;
-    return parseAnthropicStatus(data, checkedAt);
+    const data = (await response.json()) as AnthropicSummaryResponse;
+    return parseAnthropicSummary(data, checkedAt);
   } catch (error) {
     logError("checkAnthropicStatus", error);
 
@@ -81,37 +98,81 @@ export async function checkAnthropicStatus(): Promise<OfficialStatusResult> {
  * - 'minor': 轻微问题/性能降级
  * - 'major': 重大问题/部分服务不可用
  * - 'critical': 严重故障/服务中断
+ *
+ * component status 值:
+ * - 'operational': 正常运行
+ * - 'degraded_performance': 性能降级
+ * - 'partial_outage': 部分中断
+ * - 'major_outage': 重大故障
  */
-function parseAnthropicStatus(
-  data: AnthropicStatusResponse,
+function parseAnthropicSummary(
+  data: AnthropicSummaryResponse,
   checkedAt: string
 ): OfficialStatusResult {
   const indicator = data.status.indicator.toLowerCase();
   const description = data.status.description;
+  const components = data.components || [];
 
+  // 收集非正常运行的组件
+  const affectedComponents: string[] = [];
+  let hasDownComponents = false;
+  let hasDegradedComponents = false;
+
+  for (const component of components) {
+    const compStatus = component.status.toLowerCase();
+
+    if (compStatus !== "operational") {
+      affectedComponents.push(component.name);
+
+      if (
+        compStatus.includes("outage") ||
+        compStatus.includes("down") ||
+        compStatus === "major_outage"
+      ) {
+        hasDownComponents = true;
+      } else if (
+        compStatus.includes("degraded") ||
+        compStatus === "degraded_performance"
+      ) {
+        hasDegradedComponents = true;
+      }
+    }
+  }
+
+  // 判断整体状态
   let status: OfficialHealthStatus;
 
-  switch (indicator) {
-    case "none":
-      status = "operational";
-      break;
+  if (indicator === "none" && affectedComponents.length === 0) {
+    status = "operational";
+  } else if (
+    indicator === "critical" ||
+    indicator === "major" ||
+    hasDownComponents
+  ) {
+    status = "down";
+  } else if (indicator === "minor" || hasDegradedComponents) {
+    status = "degraded";
+  } else {
+    status = "unknown";
+  }
 
-    case "minor":
-      status = "degraded";
-      break;
+  // 生成状态消息
+  let message = description;
 
-    case "major":
-    case "critical":
-      status = "down";
-      break;
-
-    default:
-      status = "unknown";
+  if (affectedComponents.length > 0) {
+    const componentList = affectedComponents.slice(0, 3).join(", ");
+    const suffix =
+      affectedComponents.length > 3
+        ? ` 等 ${affectedComponents.length} 个组件`
+        : "";
+    message = `${componentList}${suffix} 受影响`;
   }
 
   return {
     status,
-    message: description || "未知状态",
+    message: message || "未知状态",
     checkedAt,
+    affectedComponents:
+      affectedComponents.length > 0 ? affectedComponents : undefined,
   };
 }
