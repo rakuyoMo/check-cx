@@ -57,6 +57,8 @@ export function DashboardView({ initialData }: DashboardViewProps) {
       initialData.generatedAt
     )
   );
+  const [isCoarsePointer, setIsCoarsePointer] = useState(false);
+  const [activeOfficialCardId, setActiveOfficialCardId] = useState<string | null>(null);
   const latestCheckTimestamp = useMemo(
     () => getLatestCheckTimestamp(data.providerTimelines),
     [data.providerTimelines]
@@ -86,6 +88,30 @@ export function DashboardView({ initialData }: DashboardViewProps) {
   useEffect(() => {
     setData(initialData);
   }, [initialData]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const media = window.matchMedia("(pointer: coarse)");
+
+    const updatePointerType = () => {
+      const hasTouch = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
+      setIsCoarsePointer(media.matches || hasTouch);
+    };
+
+    updatePointerType();
+    media.addEventListener("change", updatePointerType);
+
+    return () => media.removeEventListener("change", updatePointerType);
+  }, []);
+
+  useEffect(() => {
+    if (!isCoarsePointer) {
+      setActiveOfficialCardId(null);
+    }
+  }, [isCoarsePointer]);
 
   useEffect(() => {
     if (!data.pollIntervalMs || data.pollIntervalMs <= 0) {
@@ -229,7 +255,20 @@ export function DashboardView({ initialData }: DashboardViewProps) {
                       </p>
                       <p className="mt-1 text-foreground">
                         {officialStatus && officialStatusMeta ? (
-                          <HoverCard openDelay={200}>
+                          <HoverCard
+                            openDelay={isCoarsePointer ? 0 : 200}
+                            open={
+                              isCoarsePointer
+                                ? activeOfficialCardId === id
+                                : undefined
+                            }
+                            onOpenChange={
+                              isCoarsePointer
+                                ? (nextOpen) =>
+                                    setActiveOfficialCardId(nextOpen ? id : null)
+                                : undefined
+                            }
+                          >
                             <HoverCardTrigger asChild>
                               <button
                                 type="button"
@@ -238,6 +277,14 @@ export function DashboardView({ initialData }: DashboardViewProps) {
                                   officialStatusMeta.color
                                 )}
                                 aria-label={`官方状态：${officialStatusMeta.label}，点按查看详情`}
+                                onClick={
+                                  isCoarsePointer
+                                    ? () =>
+                                        setActiveOfficialCardId((current) =>
+                                          current === id ? null : id
+                                        )
+                                    : undefined
+                                }
                               >
                                 <span
                                   className="h-1.5 w-1.5 rounded-full bg-current"
