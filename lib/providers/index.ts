@@ -8,7 +8,8 @@ import { checkOpenAI } from "./openai";
 import { checkGemini } from "./gemini";
 import { checkAnthropic } from "./anthropic";
 
-const MAX_REQUEST_ABORT_RETRIES = 1;
+// 最多尝试 3 次：初始一次 + 2 次重试
+const MAX_REQUEST_ABORT_RETRIES = 2;
 const FAILURE_CONFIRM_RETRIES = 1;
 const REQUEST_ABORTED_PATTERN = /request was aborted\.?/i;
 

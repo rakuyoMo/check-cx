@@ -6,17 +6,10 @@
  * - 获取所有可用的分组列表
  */
 import { loadProviderConfigsFromDB } from "../database/config-loader";
-import { runProviderChecks } from "../providers";
-import { appendHistory, loadHistory } from "../database/history";
 import { getPollingIntervalLabel, getPollingIntervalMs } from "./polling-config";
-import { getPingCacheEntry } from "./global-state";
-import { ensureOfficialStatusPoller, getOfficialStatus } from "./official-status-poller";
-import type {
-  ProviderTimeline,
-  RefreshMode,
-  HistorySnapshot,
-  CheckResult,
-} from "../types";
+import { ensureOfficialStatusPoller } from "./official-status-poller";
+import { buildProviderTimelines, loadSnapshotForScope } from "./health-snapshot-service";
+import type { ProviderTimeline, RefreshMode } from "../types";
 
 // 未分组标识常量
 const UNGROUPED_KEY = "__ungrouped__";
@@ -89,7 +82,6 @@ export async function loadGroupDashboardData(
     return null;
   }
 
-  // 分离维护中的配置和正常配置
   const maintenanceConfigs = groupConfigs.filter((cfg) => cfg.is_maintenance);
   const activeConfigs = groupConfigs.filter((cfg) => !cfg.is_maintenance);
 
@@ -99,125 +91,19 @@ export async function loadGroupDashboardData(
   const providerKey =
     allowedIds.size > 0 ? [...allowedIds].sort().join("|") : "__empty__";
   const cacheKey = `group:${targetGroupName}:${pollIntervalMs}:${providerKey}`;
-  const cacheEntry = getPingCacheEntry(cacheKey);
-
-  const filterHistory = (history: HistorySnapshot): HistorySnapshot => {
-    if (allowedIds.size === 0) {
-      return {};
-    }
-    return Object.fromEntries(
-      Object.entries(history).filter(([id]) => allowedIds.has(id))
-    );
-  };
-
-  const readFilteredHistory = async () => filterHistory(await loadHistory());
-
-  const refreshHistory = async () => {
-    if (allowedIds.size === 0) {
-      return {};
-    }
-    const now = Date.now();
-    if (cacheEntry.history && now - cacheEntry.lastPingAt < pollIntervalMs) {
-      return cacheEntry.history;
-    }
-    if (cacheEntry.inflight) {
-      return cacheEntry.inflight;
-    }
-
-    const inflightPromise = (async () => {
-      const results = await runProviderChecks(activeConfigs);
-      let nextHistory: HistorySnapshot;
-      if (results.length > 0) {
-        nextHistory = filterHistory(await appendHistory(results));
-      } else {
-        nextHistory = await readFilteredHistory();
-      }
-      cacheEntry.history = nextHistory;
-      cacheEntry.lastPingAt = Date.now();
-      return nextHistory;
-    })();
-
-    cacheEntry.inflight = inflightPromise;
-    try {
-      return await inflightPromise;
-    } finally {
-      if (cacheEntry.inflight === inflightPromise) {
-        cacheEntry.inflight = undefined;
-      }
-    }
-  };
-
-  let history = await readFilteredHistory();
   const refreshMode = options?.refreshMode ?? "missing";
 
-  if (refreshMode === "always") {
-    history = await refreshHistory();
-  } else if (
-    refreshMode === "missing" &&
-    allowedIds.size > 0 &&
-    Object.keys(history).length === 0
-  ) {
-    history = await refreshHistory();
-  }
-
-  const mappedTimelines = Object.entries(history).map<ProviderTimeline | null>(
-    ([id, items]) => {
-      const sorted = [...items].sort(
-        (a, b) => new Date(b.checkedAt).getTime() - new Date(a.checkedAt).getTime()
-      );
-
-      if (sorted.length === 0) {
-        return null;
-      }
-
-      // 附加官方状态到最新的 CheckResult
-      const latest = { ...sorted[0] };
-      const officialStatus = getOfficialStatus(latest.type);
-      if (officialStatus) {
-        latest.officialStatus = officialStatus;
-      }
-
-      return {
-        id,
-        items: sorted,
-        latest,
-      };
-    }
+  const history = await loadSnapshotForScope(
+    {
+      cacheKey,
+      pollIntervalMs,
+      activeConfigs,
+      allowedIds,
+    },
+    refreshMode
   );
 
-  // 为维护中的配置生成虚拟时间线
-  const maintenanceTimelines = maintenanceConfigs.map<ProviderTimeline>((config) => {
-    const latest: CheckResult = {
-      id: config.id,
-      name: config.name,
-      type: config.type,
-      endpoint: config.endpoint,
-      model: config.model,
-      status: "maintenance",
-      latencyMs: null,
-      pingLatencyMs: null,
-      message: "配置处于维护模式",
-      checkedAt: new Date().toISOString(),
-      groupName: config.groupName || null,
-    };
-
-    // 附加官方状态
-    const officialStatus = getOfficialStatus(config.type);
-    if (officialStatus) {
-      latest.officialStatus = officialStatus;
-    }
-
-    return {
-      id: config.id,
-      items: [],
-      latest,
-    };
-  });
-
-  const providerTimelines = [
-    ...mappedTimelines.filter((timeline): timeline is ProviderTimeline => Boolean(timeline)),
-    ...maintenanceTimelines,
-  ].sort((a, b) => a.latest.name.localeCompare(b.latest.name));
+  const providerTimelines = buildProviderTimelines(history, maintenanceConfigs);
 
   const allEntries = providerTimelines
     .flatMap((timeline) => timeline.items)

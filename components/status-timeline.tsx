@@ -46,7 +46,13 @@ export function StatusTimeline({ items, nextRefreshInMs }: StatusTimelineProps) 
     const media = window.matchMedia("(pointer: coarse)");
     const updatePointerType = () => {
       const hasTouch = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
-      setIsCoarsePointer(media.matches || hasTouch);
+      const nextIsCoarse = media.matches || hasTouch;
+      setIsCoarsePointer((prev) => {
+        if (prev && !nextIsCoarse) {
+          setActiveSegmentKey(null);
+        }
+        return nextIsCoarse;
+      });
     };
 
     updatePointerType();
@@ -54,12 +60,6 @@ export function StatusTimeline({ items, nextRefreshInMs }: StatusTimelineProps) 
 
     return () => media.removeEventListener("change", updatePointerType);
   }, []);
-
-  useEffect(() => {
-    if (!isCoarsePointer) {
-      setActiveSegmentKey(null);
-    }
-  }, [isCoarsePointer]);
 
   if (items.length === 0) {
     return (

@@ -3,6 +3,7 @@
  */
 
 import "server-only";
+import type { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "../supabase/server";
 import type { CheckResult, HistorySnapshot } from "../types";
 import { logError } from "../utils";
@@ -10,23 +11,200 @@ import { logError } from "../utils";
 /**
  * 每个 Provider 最多保留的历史记录数
  */
-const MAX_POINTS_PER_PROVIDER = 60;
+export const MAX_POINTS_PER_PROVIDER = 60;
+
+const RPC_RECENT_HISTORY = "get_recent_check_history";
+const RPC_PRUNE_HISTORY = "prune_check_history";
+
+export interface HistoryQueryOptions {
+  allowedIds?: Iterable<string> | null;
+}
+
+interface RpcHistoryRow {
+  config_id: string;
+  status: string;
+  latency_ms: number | null;
+  ping_latency_ms: number | null;
+  checked_at: string;
+  message: string | null;
+  name: string;
+  type: string;
+  model: string;
+  endpoint: string | null;
+  group_name: string | null;
+}
 
 /**
- * 从数据库加载历史记录
- * 语义：按 Provider 加载“最新的最多 60 条记录”，不再按固定时间窗口截断
- * @returns 按 config_id 分组的历史记录
+ * SnapshotStore 负责与数据库交互，提供统一的读/写/清理接口
  */
-export async function loadHistory(): Promise<HistorySnapshot> {
-  try {
-    const supabase = await createClient();
+class SnapshotStore {
+  async fetch(options?: HistoryQueryOptions): Promise<HistorySnapshot> {
+    const normalizedIds = normalizeAllowedIds(options?.allowedIds);
+    if (Array.isArray(normalizedIds) && normalizedIds.length === 0) {
+      return {};
+    }
 
-    // 从数据库查询最新的记录,使用 JOIN 获取配置信息
-    const { data, error } = await supabase
+    const supabase = await createClient();
+    const { data, error } = await supabase.rpc<RpcHistoryRow[]>(
+      RPC_RECENT_HISTORY,
+      {
+        limit_per_config: MAX_POINTS_PER_PROVIDER,
+        target_config_ids: normalizedIds,
+      }
+    );
+
+    if (error) {
+      logError("获取历史快照失败", error);
+      if (isMissingFunctionError(error)) {
+        return fallbackFetchSnapshot(supabase, normalizedIds);
+      }
+      return {};
+    }
+
+    return mapRowsToSnapshot(data);
+  }
+
+  async append(results: CheckResult[]): Promise<void> {
+    if (results.length === 0) {
+      return;
+    }
+
+    const supabase = await createClient();
+    const records = results.map((result) => ({
+      config_id: result.id,
+      status: result.status,
+      latency_ms: result.latencyMs,
+      ping_latency_ms: result.pingLatencyMs,
+      checked_at: result.checkedAt,
+      message: result.message,
+    }));
+
+    const { error } = await supabase.from("check_history").insert(records);
+    if (error) {
+      logError("写入历史记录失败", error);
+      return;
+    }
+
+    await this.pruneInternal(supabase);
+  }
+
+  async prune(limit: number = MAX_POINTS_PER_PROVIDER): Promise<void> {
+    const supabase = await createClient();
+    await this.pruneInternal(supabase, limit);
+  }
+
+  private async pruneInternal(
+    supabase: SupabaseClient,
+    limit: number = MAX_POINTS_PER_PROVIDER
+  ): Promise<void> {
+    const { error } = await supabase.rpc(RPC_PRUNE_HISTORY, {
+      limit_per_config: limit,
+    });
+
+    if (error) {
+      logError("清理历史记录失败", error);
+      if (isMissingFunctionError(error)) {
+        await fallbackPruneHistory(supabase, limit);
+      }
+    }
+  }
+}
+
+export const historySnapshotStore = new SnapshotStore();
+
+/**
+ * 兼容旧接口：读取全部历史快照
+ */
+export async function loadHistory(
+  options?: HistoryQueryOptions
+): Promise<HistorySnapshot> {
+  return historySnapshotStore.fetch(options);
+}
+
+/**
+ * 兼容旧接口：写入并返回最新快照
+ */
+export async function appendHistory(
+  results: CheckResult[]
+): Promise<HistorySnapshot> {
+  await historySnapshotStore.append(results);
+  return historySnapshotStore.fetch();
+}
+
+function normalizeAllowedIds(
+  ids?: Iterable<string> | null
+): string[] | null {
+  if (!ids) {
+    return null;
+  }
+  const array = Array.from(ids).filter(Boolean);
+  return array.length > 0 ? array : [];
+}
+
+function mapRowsToSnapshot(rows: RpcHistoryRow[] | null): HistorySnapshot {
+  if (!rows || rows.length === 0) {
+    return {};
+  }
+
+  const history: HistorySnapshot = {};
+  for (const row of rows) {
+    const result: CheckResult = {
+      id: row.config_id,
+      name: row.name,
+      type: row.type as CheckResult["type"],
+      endpoint: row.endpoint ?? "",
+      model: row.model,
+      status: row.status as CheckResult["status"],
+      latencyMs: row.latency_ms,
+      pingLatencyMs: row.ping_latency_ms,
+      checkedAt: row.checked_at,
+      message: row.message ?? "",
+      groupName: row.group_name,
+    };
+
+    if (!history[result.id]) {
+      history[result.id] = [];
+    }
+    history[result.id].push(result);
+  }
+
+  for (const key of Object.keys(history)) {
+    history[key] = history[key]
+      .sort(
+        (a, b) => new Date(b.checkedAt).getTime() - new Date(a.checkedAt).getTime()
+      )
+      .slice(0, MAX_POINTS_PER_PROVIDER);
+  }
+
+  return history;
+}
+
+function isMissingFunctionError(error: PostgrestError | null): boolean {
+  if (!error?.message) {
+    return false;
+  }
+  return (
+    error.message.includes(RPC_RECENT_HISTORY) ||
+    error.message.includes(RPC_PRUNE_HISTORY)
+  );
+}
+
+async function fallbackFetchSnapshot(
+  supabase: SupabaseClient,
+  allowedIds: string[] | null
+): Promise<HistorySnapshot> {
+  try {
+    let query = supabase
       .from("check_history")
       .select(
         `
-        *,
+        id,
+        config_id,
+        status,
+        latency_ms,
+        ping_latency_ms,
+        checked_at,
+        message,
         check_configs!fk_config (
           id,
           name,
@@ -39,17 +217,20 @@ export async function loadHistory(): Promise<HistorySnapshot> {
       )
       .order("checked_at", { ascending: false });
 
+    if (allowedIds) {
+      query = query.in("config_id", allowedIds);
+    }
+
+    const { data, error } = await query;
     if (error) {
-      logError("从数据库读取历史记录失败", error);
+      logError("fallback 模式下读取历史失败", error);
       return {};
     }
 
-    // 转换为 HistorySnapshot 格式
     const history: HistorySnapshot = {};
     for (const record of data || []) {
       const config = record.check_configs;
       if (!config) {
-        console.warn(`[check-cx] 记录 ${record.id} 的配置不存在,跳过`);
         continue;
       }
 
@@ -59,12 +240,12 @@ export async function loadHistory(): Promise<HistorySnapshot> {
         type: config.type,
         endpoint: config.endpoint,
         model: config.model,
-        status: record.status as "operational" | "degraded" | "failed",
+        status: record.status as CheckResult["status"],
         latencyMs: record.latency_ms,
         pingLatencyMs: record.ping_latency_ms ?? null,
         checkedAt: record.checked_at,
-        message: record.message || "",
-        groupName: config.group_name || null,
+        message: record.message ?? "",
+        groupName: config.group_name ?? null,
       };
 
       if (!history[result.id]) {
@@ -73,7 +254,6 @@ export async function loadHistory(): Promise<HistorySnapshot> {
       history[result.id].push(result);
     }
 
-    // 对每个提供商的记录进行排序和限制
     for (const key of Object.keys(history)) {
       history[key] = history[key]
         .sort(
@@ -81,116 +261,57 @@ export async function loadHistory(): Promise<HistorySnapshot> {
             new Date(b.checkedAt).getTime() - new Date(a.checkedAt).getTime()
         )
         .slice(0, MAX_POINTS_PER_PROVIDER);
-
-      if (history[key].length === 0) {
-        delete history[key];
-      }
     }
 
     return history;
   } catch (error) {
-    logError("读取历史记录失败", error);
+    logError("fallback 模式下读取历史异常", error);
     return {};
   }
 }
 
-/**
- * 追加新的检查结果到历史记录
- * @param results 检查结果列表
- * @returns 更新后的历史记录
- */
-export async function appendHistory(
-  results: CheckResult[]
-): Promise<HistorySnapshot> {
-  if (results.length === 0) {
-    return loadHistory();
-  }
-
+async function fallbackPruneHistory(
+  supabase: SupabaseClient,
+  limit: number
+): Promise<void> {
   try {
-    const supabase = await createClient();
-
-    // 将结果写入数据库,仅写入必要字段
-    const records = results.map((result) => ({
-      config_id: result.id,
-      status: result.status,
-      latency_ms: result.latencyMs,
-      ping_latency_ms: result.pingLatencyMs,
-      checked_at: result.checkedAt,
-      message: result.message,
-    }));
-
-    const { error } = await supabase.from("check_history").insert(records);
-
-    if (error) {
-      logError("写入数据库失败", error);
-    }
-
-    // 清理超出限制的数据（每个提供商只保留最新 60 条记录）
-    await cleanupOldHistory();
-
-    return loadHistory();
-  } catch (error) {
-    logError("追加历史记录失败", error);
-    return loadHistory();
-  }
-}
-
-/**
- * 清理超出保留数量的旧历史记录
- */
-async function cleanupOldHistory(): Promise<void> {
-  try {
-    const supabase = await createClient();
-
-    // 获取所有唯一的 config_id
-    const { data: providers, error: providerError } = await supabase
+    const { data, error } = await supabase
       .from("check_history")
-      .select("config_id")
-      .order("config_id");
+      .select("id, config_id, checked_at")
+      .order("config_id")
+      .order("checked_at", { ascending: false });
 
-    if (providerError) {
-      logError("查询 config_id 失败", providerError);
+    if (error || !data) {
+      if (error) {
+        logError("fallback 模式下查询历史失败", error);
+      }
       return;
     }
 
-    if (!providers) {
+    const deleteIds: string[] = [];
+    const seen = new Map<string, number>();
+    for (const record of data) {
+      const count = seen.get(record.config_id) ?? 0;
+      if (count >= limit) {
+        deleteIds.push(record.id);
+      } else {
+        seen.set(record.config_id, count + 1);
+      }
+    }
+
+    if (deleteIds.length === 0) {
       return;
     }
 
-    // 去重获取唯一的 config_id
-    const uniqueProviders = [...new Set(providers.map((p) => p.config_id))];
+    const { error: deleteError } = await supabase
+      .from("check_history")
+      .delete()
+      .in("id", deleteIds);
 
-    // 对每个提供商,删除超出限制的旧记录
-    for (const configId of uniqueProviders) {
-      // 获取该提供商的所有记录,按时间倒序
-      const { data: records, error: recordError } = await supabase
-        .from("check_history")
-        .select("id, checked_at")
-        .eq("config_id", configId)
-        .order("checked_at", { ascending: false });
-
-      if (recordError) {
-        logError(`查询 config ${configId} 的记录失败`, recordError);
-        continue;
-      }
-
-      // 如果超过 60 条,删除多余的旧记录
-      if (records && records.length > MAX_POINTS_PER_PROVIDER) {
-        const recordsToDelete = records
-          .slice(MAX_POINTS_PER_PROVIDER)
-          .map((r) => r.id);
-
-        const { error: deleteError } = await supabase
-          .from("check_history")
-          .delete()
-          .in("id", recordsToDelete);
-
-        if (deleteError) {
-          logError(`删除 config ${configId} 的旧记录失败`, deleteError);
-        }
-      }
+    if (deleteError) {
+      logError("fallback 模式下删除历史失败", deleteError);
     }
   } catch (error) {
-    logError("清理数据时发生错误", error);
+    logError("fallback 模式下清理历史异常", error);
   }
 }

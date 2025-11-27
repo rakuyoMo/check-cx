@@ -86,7 +86,10 @@
 
 - `lib/database/`
   - 与业务无关的数据库访问逻辑，统一通过 `createClient()` 访问 Supabase。
-  - 对外只暴露领域语义：`loadProviderConfigsFromDB`、`loadHistory`、`appendHistory`。
+  - 通过 `historySnapshotStore` 暴露 `fetch/append/prune` 等接口，隐藏 RPC/SQL 细节。
+- `lib/core/health-snapshot-service.ts`
+  - 负责把 `historySnapshotStore`、`runProviderChecks`、缓存与官方状态粘合在一起。
+  - 对 Dashboard 与分组 API 暴露 `loadSnapshotForScope`、`buildProviderTimelines`，彻底避免重复实现。
 
 - `lib/official-status/`
   - 封装 OpenAI / Anthropic 等官方状态接口的调用与解析，将复杂的 JSON 响应映射为 `OfficialStatusResult`。

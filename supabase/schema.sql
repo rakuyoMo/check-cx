@@ -27,6 +27,7 @@ CREATE TABLE public.check_configs (
     enabled boolean DEFAULT true,
     is_maintenance boolean DEFAULT false,
     user_agent text,
+    group_name text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
     CONSTRAINT check_configs_pkey PRIMARY KEY (id)
@@ -152,6 +153,7 @@ COMMENT ON COLUMN public.check_configs.api_key IS 'API 密钥 - 用于身份验�
 COMMENT ON COLUMN public.check_configs.enabled IS '是否启用 - true: 启用检测, false: 禁用检测';
 COMMENT ON COLUMN public.check_configs.is_maintenance IS '维护模式标记 - true: 停止健康检查, false: 正常检查';
 COMMENT ON COLUMN public.check_configs.user_agent IS '自定义 User-Agent - 用于请求时的 User-Agent 头,为 NULL 时使用默认值';
+COMMENT ON COLUMN public.check_configs.group_name IS '配置分组名称 - Dashboard 分组展示使用, NULL 表示未分组';
 COMMENT ON COLUMN public.check_configs.created_at IS '创建时间 - 配置首次创建的时间戳';
 COMMENT ON COLUMN public.check_configs.updated_at IS '更新时间 - 配置最后修改的时间戳,由触发器自动维护';
 
@@ -163,3 +165,74 @@ COMMENT ON COLUMN public.check_history.message IS '状态消息 - 详细的状�
 COMMENT ON COLUMN public.check_history.created_at IS '记录创建时间 - 记录写入数据库的时间戳';
 COMMENT ON COLUMN public.check_history.config_id IS '配置 UUID - 关联 check_configs.id,标识哪个配置的检测结果';
 
+-- RPC: 获取最近历史记录
+CREATE OR REPLACE FUNCTION public.get_recent_check_history(
+  limit_per_config integer DEFAULT 60,
+  target_config_ids uuid[] DEFAULT NULL
+)
+RETURNS TABLE (
+  config_id uuid,
+  status text,
+  latency_ms integer,
+  ping_latency_ms integer,
+  checked_at timestamptz,
+  message text,
+  name text,
+  type text,
+  model text,
+  endpoint text,
+  group_name text
+)
+LANGUAGE sql
+STABLE
+AS $$
+  WITH ranked AS (
+    SELECT
+      h.id,
+      h.config_id,
+      h.status,
+      h.latency_ms,
+      h.ping_latency_ms,
+      h.checked_at,
+      h.message,
+      ROW_NUMBER() OVER (PARTITION BY h.config_id ORDER BY h.checked_at DESC) AS rn
+    FROM check_history h
+    WHERE target_config_ids IS NULL OR h.config_id = ANY(target_config_ids)
+  )
+  SELECT
+    r.config_id,
+    r.status,
+    r.latency_ms,
+    r.ping_latency_ms,
+    r.checked_at,
+    r.message,
+    c.name,
+    c.type,
+    c.model,
+    c.endpoint,
+    c.group_name
+  FROM ranked r
+  JOIN check_configs c ON c.id = r.config_id
+  WHERE r.rn <= limit_per_config
+  ORDER BY c.name ASC, r.checked_at DESC;
+$$;
+
+-- RPC: 裁剪历史记录
+CREATE OR REPLACE FUNCTION public.prune_check_history(
+  limit_per_config integer DEFAULT 60
+)
+RETURNS void
+LANGUAGE sql
+VOLATILE
+AS $$
+  WITH ranked AS (
+    SELECT
+      id,
+      ROW_NUMBER() OVER (PARTITION BY config_id ORDER BY checked_at DESC) AS rn
+    FROM check_history
+  )
+  DELETE FROM check_history
+  WHERE id IN (
+    SELECT id FROM ranked WHERE rn > limit_per_config
+  );
+$$;

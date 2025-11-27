@@ -3,7 +3,7 @@
  * 在应用启动时自动初始化并持续运行
  */
 
-import { appendHistory } from "../database/history";
+import { historySnapshotStore } from "../database/history";
 import { loadProviderConfigsFromDB } from "../database/config-loader";
 import { runProviderChecks } from "../providers";
 import { getPollingIntervalMs } from "./polling-config";
@@ -80,14 +80,10 @@ async function tick() {
     });
 
     console.log(`[check-cx] 正在写入历史记录（${results.length} 条）…`);
-    const historySnapshot = await appendHistory(results);
-    const providerCount = Object.keys(historySnapshot).length;
-    const recordCount = Object.values(historySnapshot).reduce(
-      (total, items) => total + items.length,
-      0
-    );
+    await historySnapshotStore.append(results);
+    const providerCount = new Set(results.map((item) => item.id)).size;
     console.log(
-      `[check-cx] 历史记录更新完成：providers=${providerCount}，总记录=${recordCount}`
+      `[check-cx] 历史记录更新完成：providers=${providerCount}，本轮新增=${results.length}`
     );
 
     const statusCounts: Record<HealthStatus, number> = {
