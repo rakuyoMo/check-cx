@@ -1,5 +1,7 @@
 /**
- * OpenAI Provider 健康检查（使用官方 openai SDK）
+ * OpenAI Provider 健康检查
+ * - 标准 /chat/completions 端点使用官方 SDK
+ * - /responses 端点使用 Responses API
  */
 
 import OpenAI from "openai";
@@ -135,11 +137,147 @@ function getOpenAIClient(config: ProviderConfig): OpenAI {
 }
 
 /**
+ * 检查 endpoint 是否是 /responses 路径（OpenAI Responses API）
+ */
+function isResponsesEndpoint(endpoint: string | null | undefined): boolean {
+  if (!endpoint) return false;
+  const [withoutQuery] = endpoint.split("?");
+  return /\/responses\/?$/.test(withoutQuery);
+}
+
+/**
+ * 从 /responses 端点推导 OpenAI SDK 的 baseURL
+ * 例如：https://privnode.com/v1/responses -> https://privnode.com/v1
+ */
+function deriveResponsesBaseURL(endpoint: string): string {
+  const [withoutQuery] = endpoint.split("?");
+  return withoutQuery.replace(/\/responses\/?$/, "");
+}
+
+/**
+ * 获取 Responses API 客户端（缓存独立于 Chat Completions）
+ */
+function getResponsesClient(config: ProviderConfig): OpenAI {
+  const baseURL = deriveResponsesBaseURL(config.endpoint!);
+  const userAgent = config.userAgent || "check-cx/0.1.0";
+  const cacheKey = `responses::${baseURL}::${config.apiKey}::${userAgent}`;
+
+  const cached = openAIClientCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const client = new OpenAI({
+    apiKey: config.apiKey,
+    baseURL,
+    defaultHeaders: {
+      "User-Agent": userAgent,
+    },
+  });
+
+  openAIClientCache.set(cacheKey, client);
+  return client;
+}
+
+/**
+ * 使用 Responses API 检查（/v1/responses 端点）
+ */
+async function checkOpenAIResponses(
+  config: ProviderConfig
+): Promise<CheckResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  const displayEndpoint = config.endpoint!;
+  const pingPromise = measureEndpointPing(displayEndpoint);
+  const { requestModel, reasoningEffort } = resolveModelPreferences(config.model);
+
+  try {
+    const client = getResponsesClient(config);
+
+    // 构建 Responses API 请求参数
+    // 使用数组格式的 input 以兼容更多代理
+    const requestParams: Parameters<typeof client.responses.create>[0] = {
+      model: requestModel,
+      input: [{ type: "message", role: "user", content: "hi" }],
+      stream: true,
+    };
+
+    // Responses API 使用 reasoning.effort 而非 reasoning_effort
+    if (reasoningEffort) {
+      (requestParams as Record<string, unknown>).reasoning = { effort: reasoningEffort };
+    }
+
+    const stream = await client.responses.create(requestParams, {
+      signal: controller.signal,
+    });
+
+    // 读取首个事件即可确认服务可用
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for await (const _event of stream as AsyncIterable<unknown>) {
+      break;
+    }
+
+    const latencyMs = Date.now() - startedAt;
+    const status: HealthStatus =
+      latencyMs <= DEGRADED_THRESHOLD_MS ? "operational" : "degraded";
+
+    const message =
+      status === "degraded"
+        ? `响应成功但耗时 ${latencyMs}ms`
+        : `流式响应正常 (${latencyMs}ms)`;
+
+    const pingLatencyMs = await pingPromise;
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: displayEndpoint,
+      model: config.model,
+      status,
+      latencyMs,
+      pingLatencyMs,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } catch (error) {
+    const err = error as Error & { name?: string };
+    const message =
+      err?.name === "AbortError" ? "请求超时" : err?.message || "未知错误";
+
+    const pingLatencyMs = await pingPromise;
+    return {
+      id: config.id,
+      name: config.name,
+      type: config.type,
+      endpoint: displayEndpoint,
+      model: config.model,
+      status: "failed",
+      latencyMs: null,
+      pingLatencyMs,
+      checkedAt: new Date().toISOString(),
+      message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * 检查 OpenAI API 健康状态（流式）
  */
 export async function checkOpenAI(
   config: ProviderConfig
 ): Promise<CheckResult> {
+  // Responses API 端点
+  if (isResponsesEndpoint(config.endpoint)) {
+    return checkOpenAIResponses(config);
+  }
+
+  // 非标准端点暂不支持，回退到默认 Chat Completions
+  // 如需支持其他端点，可在此添加分支
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   const startedAt = Date.now();

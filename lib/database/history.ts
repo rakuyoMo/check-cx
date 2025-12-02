@@ -94,7 +94,7 @@ class SnapshotStore {
   }
 
   private async pruneInternal(
-    supabase: SupabaseClient,
+    supabase: SupabaseClient<any, string>,
     limit: number = MAX_POINTS_PER_PROVIDER
   ): Promise<void> {
     const { error } = await supabase.rpc(RPC_PRUNE_HISTORY, {
@@ -190,7 +190,7 @@ function isMissingFunctionError(error: PostgrestError | null): boolean {
 }
 
 async function fallbackFetchSnapshot(
-  supabase: SupabaseClient,
+  supabase: SupabaseClient<any, string>,
   allowedIds: string[] | null
 ): Promise<HistorySnapshot> {
   try {
@@ -272,7 +272,7 @@ async function fallbackFetchSnapshot(
 }
 
 async function fallbackPruneHistory(
-  supabase: SupabaseClient,
+  supabase: SupabaseClient<any, string>,
   limit: number
 ): Promise<void> {
   try {

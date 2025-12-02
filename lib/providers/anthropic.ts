@@ -57,15 +57,15 @@ function deriveAnthropicBaseURL(
  */
 function getAnthropicClient(config: ProviderConfig): Anthropic {
   const baseURL = deriveAnthropicBaseURL(config.endpoint);
-  const cacheKey = `${baseURL}::${config.apiKey}`;
+  // 使用自定义 User-Agent 或默认值
+  const userAgent = config.userAgent || "check-cx/0.1.0";
+  // 缓存 key 必须包含 userAgent，否则不同 UA 配置会共用同一个客户端
+  const cacheKey = `${baseURL}::${config.apiKey}::${userAgent}`;
 
   const cached = anthropicClientCache.get(cacheKey);
   if (cached) {
     return cached;
   }
-
-  // 使用自定义 User-Agent 或默认值
-  const userAgent = config.userAgent || "check-cx/0.1.0";
 
   const client = new Anthropic({
     apiKey: config.apiKey,
