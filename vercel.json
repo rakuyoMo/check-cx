@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "regions": ["hkg1"],
+  "env": {
+    "CHECK_POLL_INTERVAL_SECONDS": "60"
+  },
+  "crons": []
+}
