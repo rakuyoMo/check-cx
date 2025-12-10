@@ -2,9 +2,11 @@
  * Provider 检查统一入口
  */
 
+import pLimit from "p-limit";
 import type { CheckResult, ProviderConfig } from "../types";
 import { getErrorMessage, logError } from "../utils";
 import { checkWithAiSdk } from "./ai-sdk-check";
+import { getCheckConcurrency } from "../core/polling-config";
 
 // 最多尝试 3 次：初始一次 + 2 次重试
 const MAX_REQUEST_ABORT_RETRIES = 2;
@@ -80,8 +82,9 @@ export async function runProviderChecks(
     return [];
   }
 
+  const limit = pLimit(getCheckConcurrency());
   const results = await Promise.all(
-    configs.map((config) => checkWithRetry(config))
+    configs.map((config) => limit(() => checkWithRetry(config)))
   );
 
   return results.sort((a, b) => a.name.localeCompare(b.name));

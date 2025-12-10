@@ -7,6 +7,11 @@ const DEFAULT_OFFICIAL_STATUS_INTERVAL_SECONDS = 300;
 const MIN_OFFICIAL_STATUS_INTERVAL_SECONDS = 60;
 const MAX_OFFICIAL_STATUS_INTERVAL_SECONDS = 3600; // 最长 1 小时
 
+// 检查并发数配置
+const DEFAULT_CHECK_CONCURRENCY = 5;
+const MIN_CHECK_CONCURRENCY = 1;
+const MAX_CHECK_CONCURRENCY = 20;
+
 function parseIntervalSeconds() {
   const raw = process.env.CHECK_POLL_INTERVAL_SECONDS;
   const parsed = Number(raw);
@@ -71,4 +76,25 @@ export function getOfficialStatusIntervalLabel() {
     return `${minutes} 分钟`;
   }
   return `${seconds} 秒`;
+}
+
+function parseCheckConcurrency() {
+  const raw = process.env.CHECK_CONCURRENCY;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return DEFAULT_CHECK_CONCURRENCY;
+}
+
+/**
+ * 获取检查并发数
+ * 环境变量: CHECK_CONCURRENCY (默认 5, 范围 1-20)
+ */
+export function getCheckConcurrency() {
+  const concurrency = parseCheckConcurrency();
+  return Math.max(
+    MIN_CHECK_CONCURRENCY,
+    Math.min(MAX_CHECK_CONCURRENCY, concurrency)
+  );
 }
